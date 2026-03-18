@@ -1,6 +1,8 @@
 import xarray as xr
 import numpy as np
 import pylops
+from scipy.ndimage import uniform_filter1d
+from scipy.interpolate import interp1d
 
 def compute_fft2(da, dim_y='y', dim_x='x', tapering=False):
     """
@@ -63,243 +65,152 @@ def compute_fft2(da, dim_y='y', dim_x='x', tapering=False):
     
     return fft_shifted
 
+
 def compute_omega2(N2,f2,k2,l2,m2,Temp,z):
 
     Me = 5.9722*1e24  #[kg]
     G  = 6.6743*1e-11 #[m^3/kg/s^2]
     Re = 6.371*1e6    #[m]
     cp = 1003.5       #[J/kg/K]
-    
+
+    dz = np.diff(z)
+    dz = np.mean(dz)
+
     # Unit detection: Assume km if dz < 10, else meters
-    if z < 100:  
-        z *= 1e3           # Convert dz to meters
+    if np.abs(dz) < 10:        
+        z *= 1e3 # Convert z to meters
 
     g  = G*Me/(Re+z)**2   #[m/s^2]
     R  = 8.314            #[J/mol/K]
     M  = 28.949*1e-3      #[kg/mol]
     H  = R * Temp / M / g #[m]
     alpha2 = 1 / 4 / H**2 #[1/m^2]
-    omega2 = (N2 * (k2 + l2) + f2 * (m2 + alpha2)) / (k2 + l2 + m2 + alpha2) #[1/s^2]  
+    omega2 = (N2[np.newaxis,np.newaxis,:] * (k2[:,:,np.newaxis] + l2[:,:,np.newaxis]) + f2 * (m2 + alpha2[np.newaxis,np.newaxis,:])) / (k2[:,:,np.newaxis] + l2[:,:,np.newaxis] + m2 + alpha2[np.newaxis,np.newaxis,:]) #[1/s^2]  
 
     return omega2
 
-def compute_N2(Temp1,Temp2,z1,z2):
-    """
-    Compute the thermal stratification based on the local temperature gradient.
 
-    Parameters
-    ----------
-    Temp1, Temp2 : float
-        Input two temperature values separated by dz. 
-    z1, z2 : float
-        Input two z values 
-
-    Returns
-    -------
-    float
-        squared Brunt Väisälä frequency.
-    """
+def compute_N2(Temp,z):
     
     Me = 5.9722*1e24
     G  = 6.6743*1e-11
     Re = 6.371*1e6
     cp = 1003.5 #[J/kg/K]
-    
-    dz = z2 - z1             #[m]
-    z_mean = (z1+z2)/2       #[m]
-    T_mean = (Temp1+Temp2)/2 #[K]
+
+    dz = np.diff(z)
+    dz = np.mean(dz)
 
     # Unit detection: Assume km if dz < 10, else meters
-    if np.abs(dz) < 10:  
-        dz *= 1e3           # Convert dz to meters
-        z_mean*=1e3
+    if np.abs(dz) < 10:        
+        z *= 1e3 # Convert z to meters
     
-    dT_dz = (Temp2-Temp1) / dz       #[K/m]
-    g         = G*Me/(Re+z_mean)**2  #[m/s^2]
-    N2        = g/T_mean*(dT_dz+g/cp)#[1/s^2]
+    dT_dz = np.gradient(Temp,z) #[K/m]
+    g     = G*Me/(Re+z)**2  #[m/s^2]
+    N2    = g/Temp*(dT_dz+g/cp)#[1/s^2]
 
     return N2
 
-def compute_vertical_wavenumber_and_intrinsic_frequency(ds,var,dim_x='x',dim_y='y',dim_z='z',tapering=False,lat_mean=45):
-    """
-    Compute the vertical wavenumber (m) from 2D+1-FFT in z-direction.
-    Use dispersion relation to infer intrinsic frequency (omega).
 
-    Parameters
-    ----------
-    ds : xarray.DataSet
-        Input 3D data array containing wave structures to be analyzed.
-        Input 3D Temp data array to compute stratification (N). 
-        
-    var : str
-        Name of the atmospheric variable that is to be analyzed.
-        
-    dim_x, dim_y, dim_z : str
-        Names of the spatial dimensions in `ds`.
+def get_wave_parameters(ds,var,dim_x='x',dim_y='y',dim_z='z',tapering=False,lat_mean=0,window=None):
 
-    tapering : logical
-        logical whether tapering should be applied at the edges. Default: False
-    
-    lat_mean : float
-        center latitude for calculation of coriolis frequency. Default: 45
-
-    Returns
-    -------
-    xr.DataSet
-        Contains spectral power, vertical wavenumber, and intrinsic frequency as functions of 'kx', 'ky', and 'z'.
-    """
-
-    wavefield = ds[var]
     Temp      = ds['temp_bg'].mean(dim=(dim_x,dim_y)) #[K]
     Uwind     = ds['u_bg'].mean(dim=(dim_x,dim_y))    #[m/s]
     Vwind     = ds['v_bg'].mean(dim=(dim_x,dim_y))    #[m/s]
     f2        = (4*np.pi/(24*3_600)*np.sin(np.deg2rad(lat_mean)))**2 #[1/s]
 
-    fft2_test  = compute_fft2(wavefield.isel({dim_z: 0}),dim_x=dim_x,dim_y=dim_y, tapering=tapering)
-    KX, KY     = np.meshgrid(fft2_test['kx'].values, fft2_test['ky'].values, indexing='ij')  #[1/m]
-    m          = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size-1))
-    omega2     = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size-1))
-    omegaEx    = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size-1))
-    fft2_X_ABS = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size-1))
-
-    z_new = np.convolve(ds.coords[dim_z].values, [0.5, 0.5], mode='valid')
+    fft2_test  = compute_fft2(ds[var].isel({dim_z: 0}),dim_x=dim_x,dim_y=dim_y, tapering=tapering)
+    fft2_X     = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size-1),dtype=np.complex128)
+    uw         = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size))
+    vw         = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size))
+    pw         = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size))
 
     # Pay attention: Running along alt means from top to bottom!
-    for iz in range(ds.coords[dim_z].size-1):
-        dz             = np.abs(ds.coords[dim_z].isel({dim_z: iz+1}) - ds.coords[dim_z].isel({dim_z: iz}))
-        N2             = compute_N2(Temp.isel({dim_z: iz}).values,Temp.isel({dim_z: iz+1}).values,Temp[dim_z].isel({dim_z: iz}).values,Temp[dim_z].isel({dim_z: iz+1}).values) #[1/s^2]
-        fft2_result    = compute_fft2(wavefield.isel({dim_z: iz}),dim_x=dim_x,dim_y=dim_y,tapering=tapering)
-        fft2_result_dz = compute_fft2(wavefield.isel({dim_z: iz+1}),dim_x=dim_x,dim_y=dim_y,tapering=tapering)
-        fft2_X         = fft2_result*np.conjugate(fft2_result_dz)
-        fft2_X_ABS[:,:,iz]= np.abs(fft2_X).T
-        fft2_X_PHA     = np.angle(fft2_X).T     #[rad]
-        m[:,:,iz]      = fft2_X_PHA / dz.values #[rad/m]
-        T_mean         = (Temp.isel({dim_z: iz})+Temp.isel({dim_z: iz+1}))/2 #[K]
-        # intrinsic
-        omega2[:,:,iz] = compute_omega2(N2,f2,KX**2,KY**2,m[:,:,iz]**2,T_mean.values,z_new[iz]) #[1/s^2]
-        # observed
-        omegaEx[:,:,iz] = np.sqrt(omega2[:,:,iz]) + KX*Uwind.isel({dim_z: iz}).values + KY*Vwind.isel({dim_z: iz}).values #[1/s]
+    for iz in range(ds.coords[dim_z].size):
+        fft2_result_w  = compute_fft2(ds['w'].isel({dim_z: iz}),dim_x=dim_x,dim_y=dim_y,tapering=tapering)
+        fft2_result_u  = compute_fft2(ds['u'].isel({dim_z: iz}),dim_x=dim_x,dim_y=dim_y,tapering=tapering)
+        fft2_result_v  = compute_fft2(ds['v'].isel({dim_z: iz}),dim_x=dim_x,dim_y=dim_y,tapering=tapering)
+        fft2_result_p  = compute_fft2(ds['pres'].isel({dim_z: iz}),dim_x=dim_x,dim_y=dim_y,tapering=tapering)
+        if var == 'temp':
+            fft2_result_t  = compute_fft2(ds['temp'].isel({dim_z: iz}),dim_x=dim_x,dim_y=dim_y,tapering=tapering)
 
+        uw[:,:,iz]    = np.real(fft2_result_w*np.conjugate(fft2_result_u)).T
+        vw[:,:,iz]    = np.real(fft2_result_w*np.conjugate(fft2_result_v)).T
+        pw[:,:,iz]    = np.real(fft2_result_w*np.conjugate(fft2_result_p)).T
+
+        if iz > 0:
+            if var == 'w':
+                fft2_X[:,:,iz-1] = (previous_result*np.conjugate(fft2_result_w)).T
+            elif var == 'temp':
+                fft2_X[:,:,iz-1] = (previous_result*np.conjugate(fft2_result_t)).T
+
+        if var == 'w':
+            previous_result= fft2_result_w
+        elif var == 'temp':
+            previous_result= fft2_result_t
+
+    if window is not None:
+        fft2_X = uniform_filter1d(fft2_X, size=window, axis=2, mode='nearest')
+        
+    z_new_half = np.convolve(ds.coords[dim_z].values, [0.5, 0.5], mode='valid')
+    fft2_X_ABS = np.abs(fft2_X)
+    fft2_X_PHA = np.angle(fft2_X)    #[rad]
+    m          = -fft2_X_PHA/np.diff(ds.coords[dim_z].values) #[rad/m]
+    T_half     = np.interp(z_new_half[::-1],ds.coords[dim_z].values[::-1],Temp.values[::-1])
+    U_half     = np.interp(z_new_half[::-1],ds.coords[dim_z].values[::-1],Uwind.values[::-1])
+    V_half     = np.interp(z_new_half[::-1],ds.coords[dim_z].values[::-1],Vwind.values[::-1])
+    uw_half    = interp1d(ds.coords[dim_z].values[::-1], np.flip(uw,axis=2), axis=2, kind='linear')(z_new_half[::-1])
+    vw_half    = interp1d(ds.coords[dim_z].values[::-1], np.flip(vw,axis=2), axis=2, kind='linear')(z_new_half[::-1])
+    pw_half    = interp1d(ds.coords[dim_z].values[::-1], np.flip(pw,axis=2), axis=2, kind='linear')(z_new_half[::-1])
+    N2         = compute_N2(T_half,z_new_half[::-1])
+
+    KX, KY     = np.meshgrid(fft2_test['kx'].values, fft2_test['ky'].values, indexing='ij')  #[1/m]
+    # intrinsic
+    om_i = compute_omega2(N2[::-1],f2,KX**2,KY**2,m**2,T_half[::-1],z_new_half) #[1/s^2]
+    # observed
+    om_o = np.sqrt(om_i) + KX[:,:,np.newaxis]*U_half[np.newaxis,np.newaxis,::-1] + KY[:,:,np.newaxis]*V_half[np.newaxis,np.newaxis,::-1] #[1/s]
 
     result = xr.Dataset(
         {
             'm': xr.DataArray(
                 m,
                 dims=('kx','ky',dim_z),
-                coords={'kx': fft2_result['kx'], 'ky': fft2_result['ky'], dim_z: z_new},
+                coords={'kx': fft2_test['kx'], 'ky': fft2_test['ky'], dim_z: z_new_half},
             ),
-            'omega': xr.DataArray(
-                np.sqrt(omega2),
+            'omega_int': xr.DataArray(
+                np.sqrt(om_i),
                 dims=('kx','ky',dim_z),
-                coords={'kx': fft2_result['kx'], 'ky': fft2_result['ky'], dim_z: z_new},
+                coords={'kx': fft2_test['kx'], 'ky': fft2_test['ky'], dim_z: z_new_half},
             ),
-            'omega_shifted': xr.DataArray(
-                omegaEx,
+            'omega_obs': xr.DataArray(
+                om_o,
                 dims=('kx','ky',dim_z),
-                coords={'kx': fft2_result['kx'], 'ky': fft2_result['ky'], dim_z: z_new},
+                coords={'kx': fft2_test['kx'], 'ky': fft2_test['ky'], dim_z: z_new_half},
             ),
             'spectral_power': xr.DataArray(
                 fft2_X_ABS,
                 dims=('kx','ky',dim_z),
-                coords={'kx': fft2_result['kx'], 'ky': fft2_result['ky'], dim_z: z_new},
+                coords={'kx': fft2_test['kx'], 'ky': fft2_test['ky'], dim_z: z_new_half},
             ),
-
-        }
-    )
-
-    return result
-
-
-def compute_momentum_flux(ds,dim_x='x',dim_y='y',dim_z='z', tapering=False):
-    """
-    Compute the momentum flux u'w' in spectral space from 2D-FFT
-
-    Parameters
-    ----------
-    ds : xarray.DataSet
-        Input 3D data array containing wave structures to be analyzed.
-        Input 3D Temp data array to compute stratification (N).
-        Assumes data contains vertical wind 'w' and zonal wind 'u'
-
-    dim_x, dim_y, dim_z : str
-        Names of the spatial dimensions in `ds`.
-
-    Returns
-    -------
-    xr.DataSet
-        Contains momentum flux as functions of 'kx', 'ky', and 'z'.
-    """
-
-    fft2_test = compute_fft2(ds['w'].isel({dim_z: 0}),dim_x=dim_x,dim_y=dim_y,tapering=tapering)
-    uw        = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size))
-
-    for iz in range(ds.coords[dim_z].size):
-        fft2_result_w = compute_fft2(ds['w'].isel({dim_z: iz}),dim_x=dim_x,dim_y=dim_y,tapering=tapering)
-        fft2_result_u = compute_fft2(ds['u'].isel({dim_z: iz}),dim_x=dim_x,dim_y=dim_y,tapering=tapering)
-        uw[:,:,iz]    = np.real(fft2_result_w*np.conjugate(fft2_result_u)).T
-
-    z_new_half = np.convolve(ds.coords[dim_z].values, [0.5, 0.5], mode='valid')
-    uw_half    = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size-1))
-    for iz in range(ds.coords[dim_z].size-1):
-        uw_half[:,:,iz] = (uw[:,:,iz]+uw[:,:,iz+1])/2
-
-    result = xr.Dataset(
-        {
             'uw': xr.DataArray(
-                uw_half,
+                np.flip(uw_half,axis=2),
                 dims=('kx','ky',dim_z),
-                coords={'kx': fft2_result_u['kx'], 'ky': fft2_result_u['ky'], dim_z: z_new_half},
+                coords={'kx': fft2_test['kx'], 'ky': fft2_test['ky'], dim_z: z_new_half},
             ),
-        }
-    )
-
-    return result
-
-
-def compute_energy_flux(ds,dim_x='x',dim_y='y',dim_z='z', tapering=False):
-    """
-    Compute the energy flux p'w'  in spectral space from 2D-FFT
-
-    Parameters
-    ----------
-    ds : xarray.DataSet
-        Input 3D data array containing wave structures to be analyzed.
-        Input 3D Temp data array to compute stratification (N).
-        Assumes data contains vertical wind 'w' and pressure 'pres'
-
-    dim_x, dim_y, dim_z : str
-        Names of the spatial dimensions in `ds`.
-
-    Returns
-    -------
-    xr.DataSet
-        Contains energy flux as functions of 'kx', 'ky', and 'z'.
-    """
-
-    fft2_test  = compute_fft2(ds['w'].isel({dim_z: 0}),dim_x=dim_x,dim_y=dim_y, tapering=tapering)
-    pw          = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size))
-
-    for iz in range(ds.coords[dim_z].size):
-        fft2_result_w = compute_fft2(ds['w'].isel({dim_z: iz}),dim_x=dim_x,dim_y=dim_y,tapering=tapering)
-        fft2_result_p = compute_fft2(ds['pres'].isel({dim_z: iz}),dim_x=dim_x,dim_y=dim_y,tapering=tapering)
-        pw[:,:,iz]    = np.real(fft2_result_p*np.conjugate(fft2_result_w)).T
-
-    z_new_half = np.convolve(ds.coords[dim_z].values, [0.5, 0.5], mode='valid')
-    pw_half    = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size-1))
-    for iz in range(ds.coords[dim_z].size-1):
-        pw_half[:,:,iz] = (pw[:,:,iz]+pw[:,:,iz+1])/2
-
-    result = xr.Dataset(
-        {
+            'vw': xr.DataArray(
+                np.flip(vw_half,axis=2),
+                dims=('kx','ky',dim_z),
+                coords={'kx': fft2_test['kx'], 'ky': fft2_test['ky'], dim_z: z_new_half},
+            ),
             'pw': xr.DataArray(
-                pw_half,
+                np.flip(pw_half,axis=2),
                 dims=('kx','ky',dim_z),
-                coords={'kx': fft2_result_w['kx'], 'ky': fft2_result_w['ky'], dim_z: z_new_half},
+                coords={'kx': fft2_test['kx'], 'ky': fft2_test['ky'], dim_z: z_new_half},
             ),
         }
     )
 
     return result
+
 
 def remove_background(
     ds,
@@ -454,6 +365,7 @@ def remove_background(
     out.attrs = ds.attrs.copy()
 
     return out
+
 
 def lonlat_to_cartesian_grid(ds,
     lon="longitude", lat="latitude",
