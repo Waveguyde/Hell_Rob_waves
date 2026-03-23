@@ -122,6 +122,7 @@ def get_wave_parameters(ds,var,dim_x='x',dim_y='y',dim_z='z',tapering=False,lat_
     fft2_X     = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size-1),dtype=np.complex128)
     uw         = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size))
     vw         = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size))
+    uv         = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size))
     pw         = np.empty((fft2_test.coords['kx'].size,fft2_test.coords['ky'].size,ds.coords[dim_z].size))
 
     # Pay attention: Running along alt means from top to bottom!
@@ -135,6 +136,7 @@ def get_wave_parameters(ds,var,dim_x='x',dim_y='y',dim_z='z',tapering=False,lat_
 
         uw[:,:,iz]    = np.real(fft2_result_w*np.conjugate(fft2_result_u)).T
         vw[:,:,iz]    = np.real(fft2_result_w*np.conjugate(fft2_result_v)).T
+        uv[:,:,iz]    = np.real(fft2_result_u*np.conjugate(fft2_result_v)).T
         pw[:,:,iz]    = np.real(fft2_result_w*np.conjugate(fft2_result_p)).T
 
         if iz > 0:
@@ -160,6 +162,7 @@ def get_wave_parameters(ds,var,dim_x='x',dim_y='y',dim_z='z',tapering=False,lat_
     V_half     = np.interp(z_new_half[::-1],ds.coords[dim_z].values[::-1],Vwind.values[::-1])
     uw_half    = interp1d(ds.coords[dim_z].values[::-1], np.flip(uw,axis=2), axis=2, kind='linear')(z_new_half[::-1])
     vw_half    = interp1d(ds.coords[dim_z].values[::-1], np.flip(vw,axis=2), axis=2, kind='linear')(z_new_half[::-1])
+    uv_half    = interp1d(ds.coords[dim_z].values[::-1], np.flip(uv,axis=2), axis=2, kind='linear')(z_new_half[::-1])
     pw_half    = interp1d(ds.coords[dim_z].values[::-1], np.flip(pw,axis=2), axis=2, kind='linear')(z_new_half[::-1])
     N2         = compute_N2(T_half,z_new_half[::-1])
 
@@ -198,6 +201,11 @@ def get_wave_parameters(ds,var,dim_x='x',dim_y='y',dim_z='z',tapering=False,lat_
             ),
             'vw': xr.DataArray(
                 np.flip(vw_half,axis=2),
+                dims=('kx','ky',dim_z),
+                coords={'kx': fft2_test['kx'], 'ky': fft2_test['ky'], dim_z: z_new_half},
+            ),
+            'uv': xr.DataArray(
+                np.flip(uv_half,axis=2),
                 dims=('kx','ky',dim_z),
                 coords={'kx': fft2_test['kx'], 'ky': fft2_test['ky'], dim_z: z_new_half},
             ),
